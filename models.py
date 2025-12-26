@@ -371,22 +371,61 @@ class GPT2FrozenStateFusion(nn.Module):
             return (hidden2,) + output[1:]
         return hidden2
 
-    def forward(self, input_ids: torch.Tensor, labels: Optional[torch.Tensor] = None,
-                shuffle_state: bool = False, reset_state: bool = False, gate_zero: bool = False):
+    def forward(
+            self,
+            input_ids: torch.Tensor,
+            labels: Optional[torch.Tensor] = None,
+            shuffle_state: bool = False,
+            reset_state: bool = False,
+            gate_zero: bool = False,
+            state_stride: int = 1,  # NEW: inject/refresh every K steps
+    ):
+        """
+        state_stride (=K):
+          - K=1: inject fresh teacher state every step (current behavior).
+          - K>1: refresh teacher state every K steps; between refreshes, reuse last injected state.
+        """
         B, T = input_ids.shape
         device = input_ids.device
         attn_mask = torch.ones((B, T), device=device, dtype=torch.long)
 
-        state_ids = _compute_prefix_states(input_ids, self.mul, self.id_id,
-                                           shuffle_state=shuffle_state, reset_state=reset_state)
+        # --- 1) compute teacher prefix states (exact) ---
+        state_ids = _compute_prefix_states(
+            input_ids,
+            self.mul,
+            self.id_id,
+            shuffle_state=shuffle_state,
+            reset_state=reset_state,
+        )  # [B,T] long
+
+        # --- 2) apply stride: only refresh every K steps, otherwise hold last ---
+        K = int(state_stride) if state_stride is not None else 1
+        if K < 1:
+            K = 1
+
+        if K > 1 and T > 0:
+            # hold last refreshed state id
+            held = state_ids.clone()
+            # For each segment [t0, t0+K-1], copy state at t0 to all positions in segment
+            for t0 in range(0, T, K):
+                t1 = min(t0 + K, T)
+                held[:, t0:t1] = state_ids[:, t0:t0 + 1].expand(B, t1 - t0)
+            state_ids = held
+
+        # --- 3) embed+project to GPT-2 hidden size ---
         s = self.state_proj(self.state_emb(state_ids))  # [B,T,H]
         x = self.tok_emb(input_ids)  # [B,T,H]
 
-        # set cache for hook
+        # set cache for hook (injection happens at inject_layer)
         self._cached_s = s
         self._cached_gate_zero = bool(gate_zero)
 
-        out = self.gpt2(inputs_embeds=x, attention_mask=attn_mask, use_cache=False, return_dict=True)
+        out = self.gpt2(
+            inputs_embeds=x,
+            attention_mask=attn_mask,
+            use_cache=False,
+            return_dict=True,
+        )
         h_last = out.last_hidden_state[:, -1]
         logits = self.head(h_last)
 
@@ -396,3 +435,4 @@ class GPT2FrozenStateFusion(nn.Module):
 
         loss = self.loss_fn(logits, labels) if labels is not None else None
         return logits, loss
+

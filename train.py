@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 
 import argparse
 import json
@@ -61,6 +61,8 @@ def parse_args():
     p.add_argument("--gpt2_name", type=str, default="openai-community/gpt2")
     p.add_argument("--inject_layer", type=int, default=8)
     p.add_argument("--d_state", type=int, default=128)
+    p.add_argument("--state_stride", type=int, default=1,
+                   help="For gpt2_state: refresh injected teacher state every K steps (K>=1).")
     p.add_argument("--local_files_only", action="store_true")
 
     # ---- TRAIN-TIME ablations (normally keep FALSE for clean training) ----
@@ -180,6 +182,7 @@ def train_step(model, args, x, y):
             shuffle_state=args.shuffle_state,
             reset_state=args.reset_state,
             gate_zero=args.gate_zero,
+            state_stride=args.state_stride,
         )
 
     return model(x, labels=y)
@@ -217,6 +220,7 @@ def run_eval_bundle(model, args, eval_loaders, device, log_path, step, stage_len
                 shuffle_state=st_ablate["shuffle_state"],
                 reset_state=st_ablate["reset_state"],
                 gate_zero=st_ablate["gate_zero"],
+                state_stride=args.state_stride,
             )
 
             print(f"[eval] step {step} | model {args.model} | tag {eval_tag} | len {L} | final_acc {acc:.4f}")

@@ -64,6 +64,7 @@ class RandomSeqFinalDataset(Dataset):
     Random sequences of group elements ids in [0..59].
     Label: final prefix product y_T = x_T ∘ ... ∘ x_1, computed with mul.
     """
+
     def __init__(self, mul: List[List[int]], id_id: int, length: int, num_samples: int, seed: int = 0):
         super().__init__()
         self.mul = mul
@@ -96,7 +97,8 @@ class RandomSeqFinalDataset(Dataset):
 @torch.no_grad()
 def eval_final_acc(model, loader, device, model_name: str,
                    no_scan: bool = False, shuffle_M: bool = False, reset_each_step: bool = False,
-                   shuffle_state: bool = False, reset_state: bool = False, gate_zero: bool = False) -> float:
+                   shuffle_state: bool = False, reset_state: bool = False, gate_zero: bool = False,
+                   state_stride: int = 1) -> float:
     """
     Evaluate final-only accuracy.
     - exact/route1: supports mechanism ablations via (no_scan/shuffle_M/reset_each_step)
@@ -112,7 +114,13 @@ def eval_final_acc(model, loader, device, model_name: str,
         if model_name in {"exact", "route1"}:
             logits, _ = model(x, labels=None, no_scan=no_scan, shuffle_M=shuffle_M, reset_each_step=reset_each_step)
         elif model_name == "gpt2_state":
-            logits, _ = model(x, labels=None, shuffle_state=shuffle_state, reset_state=reset_state, gate_zero=gate_zero)
+            logits, _ = model(x,
+                              labels=None,
+                              shuffle_state=shuffle_state,
+                              reset_state=reset_state,
+                              gate_zero=gate_zero,
+                              state_stride=state_stride,
+                              )
         else:
             logits, _ = model(x, labels=None)
 
