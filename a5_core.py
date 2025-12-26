@@ -21,50 +21,42 @@ def _parity(perm: Tuple[int, ...]) -> int:
     n = len(perm)
     for i in range(n):
         for j in range(i + 1, n):
-            inv += perm[i] > perm[j]
+            if perm[i] > perm[j]:
+                inv += 1
     return inv % 2
 
 
 def generate_a5() -> Tuple[List[Tuple[int, ...]], List[List[int]], int]:
     """
+    Generate A5 as even permutations on 5 letters.
     Returns:
-      elements: list of 60 even permutations of (0..4)
-      mul: 60x60 Cayley table, mul[a][b] = a ∘ b (left multiply)
-      id_id: index of identity
+      elems: list of 60 permutations (tuples)
+      mul: Cayley table ids: mul[g][s] = g ∘ s
+      id_id: identity element id
     """
-    base = list(range(5))
-    # generate all permutations of 5
-    perms = []
-    def backtrack(cur, used):
-        if len(cur) == 5:
-            perms.append(tuple(cur))
-            return
-        for i in range(5):
-            if not used[i]:
-                used[i] = True
-                cur.append(i)
-                backtrack(cur, used)
-                cur.pop()
-                used[i] = False
-    backtrack([], [False] * 5)
+    # brute enumerate all permutations of 5
+    import itertools
+    perms = list(itertools.permutations(range(5)))
+    elems = [p for p in perms if _parity(p) == 0]  # A5: even perms
+    assert len(elems) == 60
 
-    elements = [p for p in perms if _parity(p) == 0]  # A5
-    assert len(elements) == 60
-
-    idx = {p: i for i, p in enumerate(elements)}
-    id_perm = tuple(base)
+    # map perm -> id
+    idx = {p: i for i, p in enumerate(elems)}
+    # identity
+    id_perm = tuple(range(5))
     id_id = idx[id_perm]
 
+    # cayley table
     mul = [[0] * 60 for _ in range(60)]
-    for i, a in enumerate(elements):
-        for j, b in enumerate(elements):
-            c = _compose(a, b)            # a ∘ b
-            mul[i][j] = idx[c]
-    return elements, mul, id_id
+    for i, p in enumerate(elems):
+        for j, q in enumerate(elems):
+            r = _compose(p, q)
+            mul[i][j] = idx[r]
+    return elems, mul, id_id
 
 
 # ----------------------------
-# Dataset
+# Dataset: random sequences (final-only)
 # ----------------------------
 
 class RandomSeqFinalDataset(Dataset):
@@ -103,7 +95,13 @@ class RandomSeqFinalDataset(Dataset):
 
 @torch.no_grad()
 def eval_final_acc(model, loader, device, model_name: str,
-                   no_scan: bool = False, shuffle_M: bool = False, reset_each_step: bool = False) -> float:
+                   no_scan: bool = False, shuffle_M: bool = False, reset_each_step: bool = False,
+                   shuffle_state: bool = False, reset_state: bool = False, gate_zero: bool = False) -> float:
+    """
+    Evaluate final-only accuracy.
+    - exact/route1: supports mechanism ablations via (no_scan/shuffle_M/reset_each_step)
+    - gpt2_state: supports state-channel ablations via (shuffle_state/reset_state/gate_zero)
+    """
     model.eval()
     correct = 0
     total = 0
@@ -111,8 +109,10 @@ def eval_final_acc(model, loader, device, model_name: str,
         x = batch["input_ids"].to(device)
         y = batch["label_final"].to(device)
 
-        if model_name in {"plugin_p0", "select", "exact", "route1"}:
+        if model_name in {"exact", "route1"}:
             logits, _ = model(x, labels=None, no_scan=no_scan, shuffle_M=shuffle_M, reset_each_step=reset_each_step)
+        elif model_name == "gpt2_state":
+            logits, _ = model(x, labels=None, shuffle_state=shuffle_state, reset_state=reset_state, gate_zero=gate_zero)
         else:
             logits, _ = model(x, labels=None)
 

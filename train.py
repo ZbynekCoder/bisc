@@ -1,3 +1,6 @@
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "7"
+
 import argparse
 import json
 import os
@@ -8,7 +11,14 @@ import torch
 from torch.utils.data import DataLoader
 
 from a5_core import generate_a5, RandomSeqFinalDataset, eval_final_acc
-from models import BaselineAdapter, GRUBaseline, A5ExactScan, Route1SoftScan
+from models import (
+    BaselineAdapter,
+    GRUBaseline,
+    A5ExactScan,
+    Route1SoftScan,
+    GPT2FrozenBaseline,
+    GPT2FrozenStateFusion,
+)
 
 
 def set_seed(seed: int):
@@ -20,11 +30,18 @@ def set_seed(seed: int):
 
 def parse_args():
     p = argparse.ArgumentParser()
+
+    # basic
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="cpu")
 
-    p.add_argument("--model", type=str, default="route1",
-                   choices=["adapter", "gru", "exact", "route1"])
+    # model selection
+    p.add_argument(
+        "--model",
+        type=str,
+        default="route1",
+        choices=["adapter", "gru", "exact", "route1", "gpt2", "gpt2_state"],
+    )
     p.add_argument("--d_model", type=int, default=128)
 
     # adapter
@@ -38,8 +55,31 @@ def parse_args():
     # route1
     p.add_argument("--temp", type=float, default=1.0)
     p.add_argument("--aux_weight", type=float, default=5.0)
-    p.add_argument("--anneal_aux", action="store_true",
-                   help="anneal aux_weight during training via piecewise schedule")
+    p.add_argument("--anneal_aux", action="store_true")
+
+    # gpt2 frozen / state plugin
+    p.add_argument("--gpt2_name", type=str, default="openai-community/gpt2")
+    p.add_argument("--inject_layer", type=int, default=8)
+    p.add_argument("--d_state", type=int, default=128)
+    p.add_argument("--local_files_only", action="store_true")
+
+    # ---- TRAIN-TIME ablations (normally keep FALSE for clean training) ----
+    # (You can still use these if you want to do "training-time ablation",
+    #  but for Scheme B, keep them OFF and use eval-only ablations below.)
+    p.add_argument("--shuffle_state", action="store_true")
+    p.add_argument("--reset_state", action="store_true")
+    p.add_argument("--gate_zero", action="store_true")
+
+    # ---- EVAL-ONLY ablations (Scheme B: causal intervention at eval) ----
+    # If enabled, eval will report multiple tags: clean + selected eval-only interventions.
+    p.add_argument("--eval_multi", action="store_true",
+                   help="If set, evaluate clean and selected eval-only interventions each eval event.")
+    p.add_argument("--eval_gate_zero", action="store_true",
+                   help="Eval-only: gate=0 for gpt2_state (state channel disabled).")
+    p.add_argument("--eval_shuffle_state", action="store_true",
+                   help="Eval-only: shuffle teacher states over time.")
+    p.add_argument("--eval_reset_state", action="store_true",
+                   help="Eval-only: reset teacher state each step.")
 
     # optimization
     p.add_argument("--batch_size", type=int, default=512)
@@ -49,8 +89,7 @@ def parse_args():
     # data
     p.add_argument("--train_samples", type=int, default=200000)
     p.add_argument("--test_samples_per_len", type=int, default=10000)
-    p.add_argument("--schedule", type=str, default="64",
-                   help='e.g. "64" or "2,4,8,16,32,64"')
+    p.add_argument("--schedule", type=str, default="64")
     p.add_argument("--steps_per_stage", type=int, default=5000)
     p.add_argument("--eval_lens", type=str, default="64,128,256,512")
 
@@ -59,12 +98,157 @@ def parse_args():
     p.add_argument("--eval_every", type=int, default=1000)
     p.add_argument("--out_dir", type=str, default="outputs")
 
-    # ablations (mechanism evidence)
+    # mechanism ablations for exact/route1 (executor-side)
     p.add_argument("--no_scan", action="store_true")
     p.add_argument("--shuffle_M", action="store_true")
     p.add_argument("--reset_each_step", action="store_true")
 
     return p.parse_args()
+
+
+def build_model(args, mul, id_id, device):
+    if args.model == "adapter":
+        return BaselineAdapter(
+            num_tokens=60,
+            d_model=max(args.d_model, 64),
+            mlp_layers=args.mlp_layers,
+            pool=args.pool,
+        ).to(device)
+
+    if args.model == "gru":
+        return GRUBaseline(
+            num_tokens=60,
+            d_model=max(args.d_model, 64),
+            num_layers=args.gru_layers,
+            dropout=args.gru_dropout,
+        ).to(device)
+
+    if args.model == "exact":
+        return A5ExactScan(mul_table=mul, id_id=id_id, num_tokens=60).to(device)
+
+    if args.model == "route1":
+        return Route1SoftScan(
+            mul_table=mul,
+            id_id=id_id,
+            num_tokens=60,
+            temp=args.temp,
+            aux_weight=args.aux_weight,
+        ).to(device)
+
+    if args.model == "gpt2":
+        return GPT2FrozenBaseline(
+            num_tokens=60,
+            gpt2_name=args.gpt2_name,
+            local_files_only=args.local_files_only,
+        ).to(device)
+
+    if args.model == "gpt2_state":
+        return GPT2FrozenStateFusion(
+            mul_table=mul,
+            id_id=id_id,
+            num_tokens=60,
+            gpt2_name=args.gpt2_name,
+            inject_layer=args.inject_layer,
+            d_state=args.d_state,
+            local_files_only=args.local_files_only,
+        ).to(device)
+
+    raise ValueError(args.model)
+
+
+def train_step(model, args, x, y):
+    # Optional aux anneal for route1
+    if args.model == "route1" and args.anneal_aux:
+        # simple piecewise schedule (customize if needed)
+        # NOTE: if you want to anneal by global step, implement outside and set model._aux_weight_override.
+        pass
+
+    if args.model in {"exact", "route1"}:
+        return model(
+            x,
+            labels=y,
+            no_scan=args.no_scan,
+            shuffle_M=args.shuffle_M,
+            reset_each_step=args.reset_each_step,
+        )
+
+    if args.model == "gpt2_state":
+        # TRAIN-TIME ablations (keep OFF for Scheme B clean training)
+        return model(
+            x,
+            labels=y,
+            shuffle_state=args.shuffle_state,
+            reset_state=args.reset_state,
+            gate_zero=args.gate_zero,
+        )
+
+    return model(x, labels=y)
+
+
+@torch.no_grad()
+def run_eval_bundle(model, args, eval_loaders, device, log_path, step, stage_len):
+    """
+    Scheme B:
+      - Always evaluate clean.
+      - If args.eval_multi: also evaluate selected eval-only interventions
+        (gate_zero / shuffle_state / reset_state) on the same trained model.
+    """
+    # Define eval configurations
+    eval_confs = [("clean", dict(shuffle_state=False, reset_state=False, gate_zero=False))]
+
+    if args.model == "gpt2_state" and args.eval_multi:
+        if args.eval_gate_zero:
+            eval_confs.append(("gate0", dict(shuffle_state=False, reset_state=False, gate_zero=True)))
+        if args.eval_shuffle_state:
+            eval_confs.append(("shuffle", dict(shuffle_state=True, reset_state=False, gate_zero=False)))
+        if args.eval_reset_state:
+            eval_confs.append(("reset", dict(shuffle_state=False, reset_state=True, gate_zero=False)))
+
+    for eval_tag, st_ablate in eval_confs:
+        for L, loader in eval_loaders.items():
+            acc = eval_final_acc(
+                model,
+                loader,
+                device,
+                args.model,
+                no_scan=args.no_scan,
+                shuffle_M=args.shuffle_M,
+                reset_each_step=args.reset_each_step,
+                shuffle_state=st_ablate["shuffle_state"],
+                reset_state=st_ablate["reset_state"],
+                gate_zero=st_ablate["gate_zero"],
+            )
+
+            print(f"[eval] step {step} | model {args.model} | tag {eval_tag} | len {L} | final_acc {acc:.4f}")
+
+            rec = {
+                "step": step,
+                "stage_len": stage_len,
+                "model": args.model,
+                "eval_tag": eval_tag,
+                "len": L,
+                "final_acc": acc,
+                "train_time_ablation": {
+                    "no_scan": args.no_scan,
+                    "shuffle_M": args.shuffle_M,
+                    "reset_each_step": args.reset_each_step,
+                    "shuffle_state": args.shuffle_state,
+                    "reset_state": args.reset_state,
+                    "gate_zero": args.gate_zero,
+                },
+                "eval_only_ablation": st_ablate,
+                "hparams": {
+                    "temp": args.temp if args.model == "route1" else None,
+                    "aux_weight": args.aux_weight if args.model == "route1" else None,
+                    "anneal_aux": args.anneal_aux if args.model == "route1" else None,
+                    "gpt2_name": args.gpt2_name if args.model in {"gpt2", "gpt2_state"} else None,
+                    "inject_layer": args.inject_layer if args.model == "gpt2_state" else None,
+                    "d_state": args.d_state if args.model == "gpt2_state" else None,
+                    "local_files_only": args.local_files_only if args.model in {"gpt2", "gpt2_state"} else None,
+                },
+            }
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
 def main():
@@ -75,20 +259,7 @@ def main():
     _, mul, id_id = generate_a5()
     device = torch.device(args.device)
 
-    # model
-    if args.model == "adapter":
-        model = BaselineAdapter(num_tokens=60, d_model=max(args.d_model, 64),
-                                mlp_layers=args.mlp_layers, pool=args.pool).to(device)
-    elif args.model == "gru":
-        model = GRUBaseline(num_tokens=60, d_model=max(args.d_model, 64),
-                            num_layers=args.gru_layers, dropout=args.gru_dropout).to(device)
-    elif args.model == "exact":
-        model = A5ExactScan(mul_table=mul, id_id=id_id, num_tokens=60).to(device)
-    elif args.model == "route1":
-        model = Route1SoftScan(mul_table=mul, id_id=id_id, num_tokens=60,
-                               temp=args.temp, aux_weight=args.aux_weight).to(device)
-    else:
-        raise ValueError(args.model)
+    model = build_model(args, mul, id_id, device)
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = None
@@ -98,22 +269,22 @@ def main():
     eval_lens = [int(x) for x in args.eval_lens.split(",") if x.strip()]
     eval_loaders = {}
     for L in eval_lens:
-        ds = RandomSeqFinalDataset(mul, id_id, length=L,
-                                  num_samples=args.test_samples_per_len, seed=args.seed + 1000 + L)
-        eval_loaders[L] = DataLoader(ds, batch_size=args.batch_size, shuffle=False)
+        ds = RandomSeqFinalDataset(mul, id_id, length=L, num_samples=args.test_samples_per_len, seed=args.seed + 100 + L)
+        eval_loaders[L] = DataLoader(ds, batch_size=args.batch_size, shuffle=False, drop_last=False)
 
     schedule = [int(x) for x in args.schedule.split(",") if x.strip()]
+    assert len(schedule) >= 1
+
     log_path = os.path.join(args.out_dir, "log_final.jsonl")
+    if os.path.exists(log_path):
+        os.remove(log_path)
+
     step = 0
-
     for stage_len in schedule:
-        train_ds = RandomSeqFinalDataset(mul, id_id, length=stage_len,
-                                         num_samples=args.train_samples, seed=args.seed + stage_len)
-        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
+        ds_train = RandomSeqFinalDataset(mul, id_id, length=stage_len, num_samples=args.train_samples, seed=args.seed + stage_len)
+        train_loader = DataLoader(ds_train, batch_size=args.batch_size, shuffle=True, drop_last=True)
 
-        labels_preview = train_ds.labels[:10].tolist()
-        labels_unique = torch.unique(train_ds.labels).numel()
-        print(f"[stage_start] stage_len {stage_len} | labels_head {labels_preview} | unique {labels_unique}")
+        print(f"[stage_start] stage_len {stage_len} | steps {args.steps_per_stage}")
 
         it = iter(train_loader)
         for _ in range(args.steps_per_stage):
@@ -126,22 +297,7 @@ def main():
             x = batch["input_ids"].to(device)
             y = batch["label_final"].to(device)
 
-            # optional aux anneal for route1
-            if args.model == "route1" and args.anneal_aux:
-                if step < 500:
-                    model._aux_weight_override = args.aux_weight
-                elif step < 1000:
-                    model._aux_weight_override = 1.0
-                elif step < 1500:
-                    model._aux_weight_override = 0.2
-                else:
-                    model._aux_weight_override = 0.0
-
-            if args.model in {"exact", "route1"}:
-                logits, loss = model(x, labels=y, no_scan=args.no_scan,
-                                     shuffle_M=args.shuffle_M, reset_each_step=args.reset_each_step)
-            else:
-                logits, loss = model(x, labels=y)
+            logits, loss = train_step(model, args, x, y)
 
             if optimizer is not None:
                 optimizer.zero_grad()
@@ -153,36 +309,12 @@ def main():
                 print(f"step {step} | stage_len {stage_len} | loss {loss.item():.6f}")
 
             if step % args.eval_every == 0 and step > 0:
-                for L, loader in eval_loaders.items():
-                    acc = eval_final_acc(model, loader, device, args.model,
-                                         no_scan=args.no_scan, shuffle_M=args.shuffle_M, reset_each_step=args.reset_each_step)
-                    print(f"[eval] step {step} | model {args.model} | len {L} | final_acc {acc:.4f}")
-                    with open(log_path, "a", encoding="utf-8") as f:
-                        f.write(json.dumps({
-                            "step": step,
-                            "stage_len": stage_len,
-                            "model": args.model,
-                            "len": L,
-                            "final_acc": acc,
-                            "ablation": {
-                                "no_scan": args.no_scan,
-                                "shuffle_M": args.shuffle_M,
-                                "reset_each_step": args.reset_each_step,
-                            },
-                            "hparams": {
-                                "temp": args.temp if args.model == "route1" else None,
-                                "aux_weight": args.aux_weight if args.model == "route1" else None,
-                                "anneal_aux": args.anneal_aux if args.model == "route1" else None,
-                            }
-                        }) + "\n")
+                run_eval_bundle(model, args, eval_loaders, device, log_path, step, stage_len)
 
             step += 1
 
         print(f"[stage_end] stage_len {stage_len}")
-        for L, loader in eval_loaders.items():
-            acc = eval_final_acc(model, loader, device, args.model,
-                                 no_scan=args.no_scan, shuffle_M=args.shuffle_M, reset_each_step=args.reset_each_step)
-            print(f"[eval] step {step} | model {args.model} | len {L} | final_acc {acc:.4f}")
+        run_eval_bundle(model, args, eval_loaders, device, log_path, step, stage_len)
 
     print(f"Logs written to: {log_path}")
 
